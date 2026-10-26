@@ -1,0 +1,121 @@
+# Builds every image in images/default.nix per architecture with nix, pushes
+# them to ghcr.io and stitches them into one multi-arch tag.
+#
+# Works on GitHub Actions and Forgejo Actions (Forgejo reads .github/workflows
+# when there is no .forgejo/workflows). Optional repo variables/secrets:
+#   vars.SYSTEMS          JSON list of nix systems, default both linux arches
+#   vars.RUNNER_X86_64    runner label for x86_64-linux  (default ubuntu-latest)
+#   vars.RUNNER_AARCH64   runner label for aarch64-linux (default ubuntu-24.04-arm)
+#   vars.IMAGE_NAMESPACE  ghcr.io namespace (default: repository owner)
+#   secrets.GHCR_USERNAME / secrets.GHCR_TOKEN
+#                         needed on Forgejo (a GitHub PAT with write:packages);
+#                         on GitHub the built-in GITHUB_TOKEN is used.
+name: images
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+defaults:
+  run:
+    shell: bash
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  # Pull requests only build; nothing is pushed.
+  PUSH: ${{ github.event_name != 'pull_request' }}
+
+jobs:
+  discover:
+    runs-on: ${{ vars.RUNNER_X86_64 || 'ubuntu-latest' }}
+    outputs:
+      images: ${{ steps.images.outputs.images }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: has-nix
+        run: echo "found=$(command -v nix >/dev/null && echo true || echo false)" >> "$GITHUB_OUTPUT"
+      - if: steps.has-nix.outputs.found == 'false'
+        uses: cachix/install-nix-action@v31
+      - id: images
+        run: echo "images=$(nix --extra-experimental-features 'nix-command flakes' eval --json .#imageNames)" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: discover
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ${{ fromJSON(needs.discover.outputs.images) }}
+        system: ${{ fromJSON(vars.SYSTEMS || '["x86_64-linux","aarch64-linux"]') }}
+    runs-on: ${{ matrix.system == 'aarch64-linux' && (vars.RUNNER_AARCH64 || 'ubuntu-24.04-arm') || (vars.RUNNER_X86_64 || 'ubuntu-latest') }}
+    env:
+      NIX_CONFIG: experimental-features = nix-command flakes
+    steps:
+      - uses: actions/checkout@v4
+      - id: has-nix
+        run: echo "found=$(command -v nix >/dev/null && echo true || echo false)" >> "$GITHUB_OUTPUT"
+      - if: steps.has-nix.outputs.found == 'false'
+        uses: cachix/install-nix-action@v31
+
+      - name: Build
+        run: nix build -L .#packages.${{ matrix.system }}.${{ matrix.image }}-image
+
+      - name: Push
+        if: env.PUSH == 'true'
+        env:
+          REGISTRY_USER: ${{ secrets.GHCR_USERNAME || github.actor }}
+          REGISTRY_TOKEN: ${{ secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}
+          NAMESPACE: ${{ vars.IMAGE_NAMESPACE || github.repository_owner }}
+        run: |
+          export REPO="$REGISTRY/${NAMESPACE,,}/${{ matrix.image }}"
+          nix develop --command bash -euo pipefail -c '
+            crane auth login "$REGISTRY" -u "$REGISTRY_USER" --password-stdin <<< "$REGISTRY_TOKEN"
+            skopeo copy --insecure-policy docker-archive:result "docker://$REPO:${{ github.sha }}-${{ matrix.system }}"
+          '
+
+  manifest:
+    needs: [discover, build]
+    if: github.event_name != 'pull_request'
+    strategy:
+      matrix:
+        image: ${{ fromJSON(needs.discover.outputs.images) }}
+    runs-on: ${{ vars.RUNNER_X86_64 || 'ubuntu-latest' }}
+    env:
+      NIX_CONFIG: experimental-features = nix-command flakes
+    steps:
+      - uses: actions/checkout@v4
+      - id: has-nix
+        run: echo "found=$(command -v nix >/dev/null && echo true || echo false)" >> "$GITHUB_OUTPUT"
+      - if: steps.has-nix.outputs.found == 'false'
+        uses: cachix/install-nix-action@v31
+
+      - name: Create multi-arch tags
+        env:
+          REGISTRY_USER: ${{ secrets.GHCR_USERNAME || github.actor }}
+          REGISTRY_TOKEN: ${{ secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}
+          NAMESPACE: ${{ vars.IMAGE_NAMESPACE || github.repository_owner }}
+          SYSTEMS: ${{ vars.SYSTEMS || '["x86_64-linux","aarch64-linux"]' }}
+          SHA: ${{ github.sha }}
+          IS_DEFAULT_BRANCH: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+          IS_TAG: ${{ startsWith(github.ref, 'refs/tags/') }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          export REPO="$REGISTRY/${NAMESPACE,,}/${{ matrix.image }}"
+          nix develop --command bash -euo pipefail -c '
+            crane auth login "$REGISTRY" -u "$REGISTRY_USER" --password-stdin <<< "$REGISTRY_TOKEN"
+
+            args=()
+            for system in $(tr -d "[]\" " <<< "$SYSTEMS" | tr , " "); do
+              args+=(-m "$REPO:$SHA-$system")
+            done
+            crane index append --docker-empty-base "${args[@]}" -t "$REPO:$SHA"
+
+            if [ "$IS_DEFAULT_BRANCH" = true ]; then crane tag "$REPO:$SHA" latest; fi
+            if [ "$IS_TAG" = true ]; then crane tag "$REPO:$SHA" "$REF_NAME"; fi
+          '
